@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbagent.retrieve import Index, chunk_python, tokenize
+from bbagent.retrieve import Corpus, ContextError, Index, build_sources, chunk_python, tokenize
 
 
 def _write(root: Path, rel: str, text: str) -> None:
@@ -78,3 +78,54 @@ class RetrievalTests(unittest.TestCase):
             self.assertTrue(any(hit.path == "visible.py" for hit in visible))
             self.assertFalse(any("hiddenmarker" in hit.text for hit in hidden))
             self.assertFalse(any("SUPERSECRETTOKEN" in hit.text for hit in secret))
+
+
+class ContextDirTests(unittest.TestCase):
+    def test_missing_directory_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ContextError):
+                build_sources(root, [str(root / "no-such-dir")])
+
+    def test_corpus_search_prefixes_external_hits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workspace = base / "ws"
+            extra = base / "spec-pack"
+            workspace.mkdir()
+            extra.mkdir()
+            _write(workspace, "app.py", "def app_main():\n    return 1\n")
+            _write(extra, "oracle.py", "def unique_oracle_marker():\n    return 1\n")
+            sources = build_sources(workspace, [str(extra)])
+            corpus = Corpus(workspace, sources, dim=128)
+            hits = corpus.search("unique_oracle_marker", k=8)
+            self.assertTrue(hits)
+            self.assertTrue(any(hit.path.startswith("@") and hit.path.endswith("oracle.py") for hit in hits))
+            self.assertTrue(any("unique_oracle_marker" in hit.text for hit in hits))
+            extras = [source for source in sources if source.alias]
+            self.assertEqual(len(extras), 1)
+            self.assertFalse(extras[0].writable)
+            self.assertEqual(extras[0].prefix, f"@{extras[0].alias}")
+            from bbagent.tools import list_dir, read_range
+
+            listed = list_dir(workspace, extras[0].prefix, sources)
+            self.assertIn("oracle.py", listed)
+            data = read_range(workspace, f"{extras[0].prefix}/oracle.py", None, None, sources)
+            self.assertNotIn("error", data)
+            self.assertIn("unique_oracle_marker", data["text"])
+            self.assertTrue(data["path"].startswith("@"))
+
+    def test_inside_workspace_dir_keeps_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "app.py", "def app_main():\n    return 1\n")
+            _write(root, "docs/guide.md", "UniqueInsideToken lives here.\n")
+            sources = build_sources(root, ["docs"])
+            corpus = Corpus(root, sources, dim=128)
+            extras = [source for source in sources if source.alias]
+            self.assertTrue(extras[0].inside)
+            self.assertTrue(extras[0].writable)
+            self.assertEqual(extras[0].prefix, "docs")
+            hits = corpus.search("UniqueInsideToken", k=8)
+            self.assertTrue(any(hit.path == "docs/guide.md" for hit in hits))
+            self.assertFalse(any(hit.path.startswith("@") for hit in hits))

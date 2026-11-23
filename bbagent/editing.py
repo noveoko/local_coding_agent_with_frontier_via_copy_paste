@@ -34,6 +34,8 @@ def resolve_path(root: Path, rel: str) -> Path:
     raw = (rel or "").strip().replace("\\", "/")
     if not raw or raw == ".":
         raise PathError("missing path")
+    if raw.startswith("@"):
+        raise PathError("context sources are read-only")
     candidate = Path(raw)
     if candidate.is_absolute() or raw.startswith("/") or (len(raw) >= 2 and raw[1] == ":"):
         raise PathError("path escapes the workspace")

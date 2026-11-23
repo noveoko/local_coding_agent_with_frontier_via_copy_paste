@@ -39,16 +39,20 @@ def run(root: Path, state: dict, replier, writer=print, confirmer=None, asker=No
 
 
 def _loop(root, state, replier, writer, confirmer, asker) -> int:
-    index = retrieve.Index(root, dim=int(state["config"]["embed_dim"]))
-    index.refresh()
-    writer(f"Indexed {len(index.chunks)} chunks from {index.file_count} files.")
+    try:
+        corpus = _corpus(root, state)
+    except retrieve.ContextError as exc:
+        writer(str(exc))
+        return 2
+    _announce_index(corpus, writer)
     if not state.get("primed"):
-        _prime(state, index)
+        _prime(state, corpus)
         state["primed"] = True
         session.save_session(root, state)
 
     while state["turn"] < int(state["config"]["max_turns"]) and not state.get("finished"):
         state = session.attach_config(root, state)
+        _attach_context(state, corpus)
         prompt = protocol.render_prompt(state, retrieve.repo_map(root))
         session.prompt_path(root).write_text(prompt, encoding="utf-8", newline="\n")
         session.save_session(root, state)
@@ -65,7 +69,9 @@ def _loop(root, state, replier, writer, confirmer, asker) -> int:
         parsed = protocol.parse_reply(reply)
         if parsed.error:
             state["gate"] = parsed.error
-            _record(state, [Result(False, "unparsed reply", parsed.error)])
+            results = [Result(False, "unparsed reply", parsed.error)]
+            _record(state, results)
+            _report_turn(writer, state["turn"], reply, results, state["gate"])
             session.save_session(root, state)
             continue
 
@@ -79,7 +85,7 @@ def _loop(root, state, replier, writer, confirmer, asker) -> int:
                 state["done_summary"] = action.summary or action.body.strip()
                 results.append(Result(True, "done requested", state["done_summary"]))
                 continue
-            result = _execute(action, root, state, index, writer, confirmer, asker)
+            result = _execute(action, root, state, corpus, writer, confirmer, asker)
             results.append(result)
             for rel in result.changed:
                 if rel not in state["files_touched"]:
@@ -112,6 +118,7 @@ def _loop(root, state, replier, writer, confirmer, asker) -> int:
                 state["gate"] = note
                 results.append(Result(False, "done rejected", note))
         _record(state, results)
+        _report_turn(writer, state["turn"], reply, results, state["gate"])
         session.save_session(root, state)
         if accepted:
             _announce(state, writer)
@@ -124,31 +131,66 @@ def _loop(root, state, replier, writer, confirmer, asker) -> int:
         "Resume with: python -m bbagent --resume"
     )
     session.save_session(root, state)
-    return 0
+    return 1
 
 
-def _prime(state: dict, index: retrieve.Index) -> None:
-    hits = index.search(state["task"], k=8)
-    if not index.chunks:
+def _corpus(root: Path, state: dict) -> retrieve.Corpus:
+    dirs = state.get("context_dirs")
+    if dirs is None:
+        dirs = state.get("config", {}).get("context_dirs") or []
+    sources = retrieve.build_sources(root, dirs)
+    return retrieve.Corpus(root, sources, dim=int(state["config"]["embed_dim"]))
+
+
+def _announce_index(corpus: retrieve.Corpus, writer) -> None:
+    index = corpus.workspace_index
+    writer(f"Indexed {len(index.chunks)} chunks from {index.file_count} files.")
+    for source in corpus.sources:
+        if not source.alias:
+            continue
+        if source.inside:
+            writer(f"Context {source.prefix}/ (inside workspace).")
+            continue
+        extra = corpus.indexes[source.alias]
+        writer(f"Context {source.prefix}: {extra.file_count} files, {len(extra.chunks)} chunks.")
+
+
+def _attach_context(state: dict, corpus: retrieve.Corpus) -> None:
+    extras = [source for source in corpus.sources if source.alias]
+    if extras:
+        state["context_sources"] = corpus.describe()
+        state["context_maps"] = corpus.maps()
+    else:
+        state["context_sources"] = []
+        state["context_maps"] = {}
+
+
+def _prime(state: dict, corpus: retrieve.Corpus) -> None:
+    hits = corpus.search(state["task"], k=8)
+    extra = any(source.alias for source in corpus.sources)
+    if corpus.empty():
         state["retrieval_note"] = "The workspace has no indexed text files."
         state["excerpts"] = []
         return
-    if retrieve.confident(hits):
+    if retrieve.confident(hits) or extra:
         state["excerpts"] = [retrieve.hit_dict(hit) for hit in hits]
-        note = (
-            "Top matches are ahead of the rest. "
-            "You may edit immediately if this code is sufficient."
-        )
+        if retrieve.confident(hits):
+            note = (
+                "Top matches are ahead of the rest. "
+                "You may edit immediately if this code is sufficient."
+            )
+        else:
+            note = "Related context was attached. Confirm the excerpts before editing."
     else:
         state["excerpts"] = []
         note = "Retrieval is uncertain. Use search or read before editing."
-    if index.capped:
+    if corpus.capped():
         note += " The index was capped at 4000 chunks."
     state["retrieval_note"] = note
     _mark_shown(state, state["excerpts"])
 
 
-def _execute(action, root, state, index, writer, confirmer, asker) -> Result:
+def _execute(action, root, state, corpus, writer, confirmer, asker) -> Result:
     kind = action.kind
     try:
         if kind == "plan":
@@ -158,12 +200,12 @@ def _execute(action, root, state, index, writer, confirmer, asker) -> Result:
             state["plan"] = text
             return Result(True, "updated plan", text)
         if kind == "search":
-            return _search(action, state, index)
+            return _search(action, state, corpus)
         if kind == "read":
-            return _read(action, root, state)
+            return _read(action, root, state, corpus)
         if kind == "list":
             rel = action.path or "."
-            return Result(True, f"list {rel}", tools.list_dir(root, rel))
+            return Result(True, f"list {rel}", tools.list_dir(root, rel, corpus.sources))
         if kind == "replace":
             if not action.path:
                 return Result(False, "replace missing path", "Provide path: ...")
@@ -196,13 +238,12 @@ def _execute(action, root, state, index, writer, confirmer, asker) -> Result:
         return Result(False, f"{kind} failed", str(exc))
 
 
-def _search(action, state, index: retrieve.Index) -> Result:
-    if index.stale():
-        index.refresh()
+def _search(action, state, corpus: retrieve.Corpus) -> Result:
+    corpus.refresh_stale()
     query = action.query.strip()
     if not query:
         return Result(False, "search missing query", "Provide query: ...")
-    hits = index.search(query, k=8)
+    hits = corpus.search(query, k=8)
     state["excerpts"] = [retrieve.hit_dict(hit) for hit in hits]
     _mark_shown(state, state["excerpts"])
     listing = "\n".join(
@@ -212,10 +253,10 @@ def _search(action, state, index: retrieve.Index) -> Result:
     return Result(True, f"search {query} -> {len(hits)} chunks", listing)
 
 
-def _read(action, root, state) -> Result:
+def _read(action, root, state, corpus: retrieve.Corpus) -> Result:
     if not action.path:
         return Result(False, "read missing path", "Provide path: ...")
-    data = tools.read_range(root, action.path, action.start, action.end)
+    data = tools.read_range(root, action.path, action.start, action.end, corpus.sources)
     if data.get("error"):
         return Result(False, f"read {action.path} failed", data["error"])
     item = {
@@ -274,6 +315,17 @@ def _evaluate_done(root, state, confirmer) -> tuple[bool, str]:
     if confirmer(message):
         return True, ""
     return False, "The user rejected done. Continue the task.\n" + summary
+
+
+def _report_turn(writer, turn: int, reply: str, results: list[Result], gate: str = "") -> None:
+    writer(f"Turn {turn}: received {len(reply)} chars")
+    for line in protocol.head_tail(reply, 8, 8).splitlines():
+        writer("  " + line)
+    for result in results:
+        mark = "ok" if result.ok else "FAIL"
+        writer(f"  [{mark}] {result.summary}")
+    if gate:
+        writer("  gate: " + gate.splitlines()[0][:160])
 
 
 def _record(state: dict, results: list[Result]) -> None:

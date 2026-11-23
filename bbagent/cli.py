@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from bbagent import clipboard, editing, loop, session
+from bbagent import clipboard, editing, loop, retrieve, session
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,6 +20,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--undo", action="store_true", help="Restore the newest file snapshot.")
     parser.add_argument("--status", action="store_true", help="Show the saved session.")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace to edit. Defaults to the current directory.")
+    parser.add_argument(
+        "--context",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Related directory to retrieve into the prompt. Repeatable.",
+    )
     args = parser.parse_args(argv)
     root = args.root.resolve()
     if not root.is_dir():
@@ -35,17 +42,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         return _status(root)
     if args.resume:
-        return _resume(root)
+        return _resume(root, args.context)
     if not args.task:
         parser.print_help()
         if session.load_session(root):
             print()
             return _status(root)
         return 2
-    return _start(root, args.task)
+    return _start(root, args.task, args.context)
 
 
-def _start(root: Path, task: str) -> int:
+def _resolved_context_dirs(root: Path, extra: list[str] | None, existing: list[str] | None = None) -> list[str] | None:
+    config = session.load_config(root)
+    dirs = session.merge_dirs(config.get("context_dirs") or [], existing or [], extra or [])
+    try:
+        retrieve.build_sources(root, dirs)
+    except retrieve.ContextError as exc:
+        print(exc, file=sys.stderr)
+        return None
+    return dirs
+
+
+def _start(root: Path, task: str, context_dirs: list[str] | None = None) -> int:
     existing = session.load_session(root)
     if existing and not existing.get("finished"):
         print("An unfinished session exists. Run: python -m bbagent --resume")
@@ -53,11 +71,13 @@ def _start(root: Path, task: str) -> int:
     if existing and existing.get("finished"):
         _clear_finished(root)
         print("Previous finished session was closed.")
-    state = session.new_session(root, task)
+    if _resolved_context_dirs(root, context_dirs) is None:
+        return 2
+    state = session.new_session(root, task, context_dirs=context_dirs)
     return loop.run(root, state, replier=_interactive_replier(root))
 
 
-def _resume(root: Path) -> int:
+def _resume(root: Path, context_dirs: list[str] | None = None) -> int:
     state = session.load_session(root)
     if state is None:
         print("No session to resume.")
@@ -65,6 +85,13 @@ def _resume(root: Path) -> int:
     if state.get("finished"):
         print("That session is already finished.")
         return 0
+    extra = context_dirs or []
+    dirs = _resolved_context_dirs(root, extra, state.get("context_dirs") or [])
+    if dirs is None:
+        return 2
+    if extra:
+        state["context_dirs"] = dirs
+        session.save_session(root, state)
     return loop.run(root, state, replier=_interactive_replier(root))
 
 
@@ -79,6 +106,9 @@ def _status(root: Path) -> int:
     print(f"finished: {'yes' if state.get('finished') else 'no'}")
     files = ", ".join(state.get("files_touched") or []) or "nothing"
     print(f"files: {files}")
+    dirs = state.get("context_dirs") or config.get("context_dirs") or []
+    if dirs:
+        print("context: " + ", ".join(str(item) for item in dirs))
     if state.get("plan"):
         print("plan: " + state["plan"].splitlines()[0])
     if state.get("gate"):
@@ -140,6 +170,7 @@ def _interactive_replier(root: Path):
                 if not copied and before_clip is not None and clip == before_clip:
                     print("Clipboard has not changed. Copy the Copilot reply, then press Enter.")
                     continue
+                print(f"Accepted clipboard reply ({len(clip)} chars).")
                 return clip
             if reply_file.is_file():
                 body = reply_file.read_text(encoding="utf-8", errors="replace")
@@ -153,6 +184,7 @@ def _interactive_replier(root: Path):
                 if previous_body is None:
                     fresh = True
                 if body.strip() and body.strip() != prompt.strip() and fresh:
+                    print(f"Accepted reply.md ({len(body)} chars).")
                     return body
             print("Clipboard is empty. Copy the reply, or save it as .bbagent/reply.md, then press Enter.")
 

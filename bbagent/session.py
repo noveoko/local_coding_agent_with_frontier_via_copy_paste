@@ -12,6 +12,7 @@ DEFAULT_CONFIG = {
     "prompt_budget": 12000,
     "max_turns": 25,
     "embed_dim": 128,
+    "context_dirs": [],
 }
 
 
@@ -54,6 +55,10 @@ def load_config(root: Path) -> dict:
     merged["prompt_budget"] = int(merged["prompt_budget"])
     merged["max_turns"] = int(merged["max_turns"])
     merged["embed_dim"] = int(merged["embed_dim"])
+    dirs = merged.get("context_dirs", [])
+    if not isinstance(dirs, list) or not all(isinstance(item, str) for item in dirs):
+        raise ValueError("context_dirs must be a JSON list of strings")
+    merged["context_dirs"] = [str(item) for item in dirs]
     return merged
 
 
@@ -63,8 +68,21 @@ def save_config(root: Path, config: dict) -> None:
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
-def new_session(root: Path, task: str) -> dict:
-    load_config(root)
+def merge_dirs(*groups: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for item in group:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def new_session(root: Path, task: str, context_dirs: list[str] | None = None) -> dict:
+    config = load_config(root)
     session = {
         "version": 1,
         "task": task,
@@ -81,6 +99,9 @@ def new_session(root: Path, task: str) -> dict:
         "finished": False,
         "done_summary": "",
         "primed": False,
+        "context_dirs": merge_dirs(config.get("context_dirs") or [], context_dirs or []),
+        "context_sources": [],
+        "context_maps": {},
     }
     save_session(root, session)
     return session

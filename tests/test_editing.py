@@ -99,6 +99,9 @@ class ApplyTests(unittest.TestCase):
             self.assertFalse(reserved.ok)
             self.assertIn("escapes", outside.message)
             self.assertIn("reserved", reserved.message)
+            alias = apply_write(root, "@spec-pack/oracle.py", "hacked\n", turn=1)
+            self.assertFalse(alias.ok)
+            self.assertIn("read-only", alias.message)
 
     def test_write_limit_snapshot_and_undo(self):
         with tempfile.TemporaryDirectory() as tmp:

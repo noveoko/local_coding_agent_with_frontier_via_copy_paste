@@ -31,24 +31,26 @@ The loop stops when Copilot emits `done` and the checks below pass, when you pre
 python -m bbagent --resume
 python -m bbagent --status
 python -m bbagent --undo
+python -m bbagent --context D:\Projects\api-spec --context D:\Projects\docs "describe the task"
 ```
 
 `--undo` restores the newest snapshot of files that turn changed.
 
 ## What Copilot must reply with
 
-Prose is ignored. The program executes one to three `bbagent` fences, in order. A failed edit stops the rest of that batch.
+Prose is ignored. The program executes one to three `bbagent` fences, in order. A failed edit stops the rest of that batch. If Copilot's copy button drops the fence, a line that starts with `action:` plus a SEARCH/REPLACE body is still executed.
 
+````
 ```bbagent
 action: replace
 path: pkg/widget.py
-```
 <<<<<<< SEARCH
 exact lines currently in the file
 =======
 replacement lines
 >>>>>>> REPLACE
 ```
+````
 
 | Action | What the program does |
 | --- | --- |
@@ -71,7 +73,8 @@ Set `test_command` in `.bbagent/config.json` to an argv list. After a successful
   "test_command": ["python", "-m", "unittest", "discover"],
   "prompt_budget": 12000,
   "max_turns": 25,
-  "embed_dim": 128
+  "embed_dim": 128,
+  "context_dirs": ["D:/Projects/api-spec", "../shared-docs"]
 }
 ```
 
@@ -86,6 +89,14 @@ Before the first prompt, and on every `search`, the workspace is ranked with two
 
 Reciprocal rank fusion merges the lists. At most 8 chunks, and at most 3 from one file, go into the prompt. The budget is 12,000 characters. Secrets (`.env`, `*.pem`, private key names) are left out of excerpts. `.gitignore` names, `.git`, and `.bbagent` are skipped.
 
+## Context directories
+
+Pass related trees with `--context` (repeatable) or `context_dirs` in `.bbagent/config.json`. Relative paths are from the workspace. `--resume` keeps the list from the session.
+
+Each extra directory is indexed on its own. Hits from outside the workspace show up as `@alias/path` (`alias` is the folder name). The first prompt lists those sources, attaches a compact map of each, and retrieves chunks that match the task. `read` and `list` accept `@alias/path`. `replace` and `write` do not. Indexes for foreign trees live under `.bbagent/index/context/` in the workspace.
+
+A directory inside the workspace stays writable through its normal relative path. Naming it in `context_dirs` adds a map and a retrieval pass over that subtree.
+
 ## Safety
 
 Edits stay inside the workspace. `.git` and `.bbagent` cannot be written. The configured test command runs on its own. Any other `run` asks for a `y` first. Recursive deletes, disk formats, `git push`, `git reset --hard`, and `git clean -fd` are refused. Snapshots live in `.bbagent/snapshots/`.
@@ -97,3 +108,11 @@ python -m unittest discover -s tests -p "test_*.py"
 ```
 
 The suite feeds canned Copilot replies through the same parser and loop. It does not need a Copilot login.
+
+To drive the real paste loop yourself (temp copy of the tiny_bug fixture, Microsoft 365 Copilot):
+
+```text
+python tests/test_hitl.py
+```
+
+`unittest discover` skips that test unless `BBAGENT_HITL` is `1`.

@@ -5,20 +5,37 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from bbagent.editing import resolve_path
-from bbagent.retrieve import SKIP_DIRS
+from bbagent.editing import PathError, resolve_path
+from bbagent.retrieve import SKIP_DIRS, find_source, split_alias
 
 MAX_READ_LINES = 200
 RUN_TIMEOUT = 60
 
 
-def list_dir(root: Path, rel: str) -> str:
-    if rel in {"", "."}:
-        path = root.resolve()
-        label = "."
+def locate(root: Path, rel: str, sources=None) -> tuple[Path, str, str]:
+    """Return (jail_root, inner_rel, display_path) for read/list."""
+    alias, inner = split_alias(rel)
+    raw = (rel or "").strip().replace("\\", "/")
+    if raw.startswith("@") and not alias:
+        raise PathError("missing context alias")
+    if alias is None:
+        return Path(root).resolve(), inner, inner or "."
+    source = find_source(list(sources or []), alias)
+    if source is None:
+        raise PathError(f"unknown context source @{alias}")
+    return source.root, inner, source.prefixed(inner)
+
+
+def list_dir(root: Path, rel: str, sources=None) -> str:
+    try:
+        jail, inner, label = locate(root, rel, sources)
+    except PathError as exc:
+        return str(exc)
+    if inner in {"", "."}:
+        path = jail
+        label = label or "."
     else:
-        path = resolve_path(root, rel)
-        label = rel
+        path = resolve_path(jail, inner)
     if not path.exists():
         return f"{label} does not exist"
     if not path.is_dir():
@@ -42,14 +59,18 @@ def list_dir(root: Path, rel: str) -> str:
     return "\n".join(lines) if lines else "(empty)"
 
 
-def read_range(root: Path, rel: str, start: int | None, end: int | None) -> dict:
+def read_range(root: Path, rel: str, start: int | None, end: int | None, sources=None) -> dict:
     from bbagent.retrieve import is_secret
 
-    path = resolve_path(root, rel)
+    try:
+        jail, inner, label = locate(root, rel, sources)
+        path = resolve_path(jail, inner)
+    except PathError as exc:
+        return {"error": str(exc)}
     if is_secret(path):
-        return {"error": f"refusing to read secret file {rel}"}
+        return {"error": f"refusing to read secret file {label}"}
     if not path.is_file():
-        return {"error": f"{rel} is not a file"}
+        return {"error": f"{label} is not a file"}
     text = path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.splitlines()
     total = len(lines)
@@ -57,7 +78,7 @@ def read_range(root: Path, rel: str, start: int | None, end: int | None) -> dict
     if start_line < 1:
         start_line = 1
     if start_line > total and total > 0:
-        return {"error": f"{rel} has {total} lines; start {start_line} is past the end"}
+        return {"error": f"{label} has {total} lines; start {start_line} is past the end"}
     if end is None:
         end_line = min(total, start_line + MAX_READ_LINES - 1)
     else:
@@ -73,8 +94,12 @@ def read_range(root: Path, rel: str, start: int | None, end: int | None) -> dict
     note = ""
     if end is None and total > end_line:
         note = f"\nTruncated at line {end_line} of {total}. Read a smaller range to see the rest."
+    try:
+        display = path.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        display = label
     return {
-        "path": path.relative_to(root.resolve()).as_posix(),
+        "path": display,
         "start": start_line,
         "end": end_line,
         "text": snippet,

@@ -6,6 +6,7 @@ whole state, because the next paste may land in a fresh chat.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -13,16 +14,16 @@ from dataclasses import dataclass, field
 EXAMPLE = """```bbagent
 action: replace
 path: pkg/widget.py
-```
 <<<<<<< SEARCH
 return None
 =======
 return value
->>>>>>> REPLACE"""
+>>>>>>> REPLACE
+```"""
 
 HEADER = """You are the reasoning engine for a local coding agent. You cannot see the filesystem. A program on the user's machine executes the actions you specify and pastes the results back. This message is the entire state. Ignore any earlier chat and any Microsoft 365 tenant files. The excerpts below are the only source of truth.
 
-Reply with one to three fenced blocks tagged bbagent. Begin your reply with ```bbagent. Prose outside the fences is ignored. Prefer the smallest edit. Use replace for edits. Use write only for a new file or a file of 40 lines or fewer. Do not invent file contents. If you have not seen a file, read or search it first. When the task is solved, emit done.
+Reply with one to three fenced blocks tagged bbagent. Begin your reply with ```bbagent. If the chat UI strips fences, start a line with action: and keep the SEARCH/REPLACE body. Prose outside the actions is ignored. Prefer the smallest edit. Use replace for edits. Use write only for a new file or a file of 40 lines or fewer. Do not invent file contents. If you have not seen a file, read or search it first. When the task is solved, emit done.
 
 Example:
 """ + EXAMPLE + """
@@ -39,8 +40,17 @@ Actions: plan, search, read, list, replace, write, run, ask, done.
 - done: a short summary
 """
 
-FENCE_RE = re.compile(r"```bbagent[^\n]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+CONTEXT_NOTE = (
+    "Paths that start with @ name a related context directory. "
+    "Read or list them. Do not replace or write them."
+)
+
+FENCE_RE = re.compile(r"`{3,}\s*bbagent[^\n]*\n(.*?)`{3,}", re.IGNORECASE | re.DOTALL)
 HEADER_RE = re.compile(r"^[A-Za-z_]+\s*:")
+ACTION_LINE_RE = re.compile(r"^action\s*:\s*\w+", re.IGNORECASE)
+PATH_LINE_RE = re.compile(r"^path\s*:", re.IGNORECASE)
+SEARCH_MARK = "<<<<<<< SEARCH"
+PROMPT_TAIL = "Begin your reply with ```bbagent."
 
 
 @dataclass
@@ -64,8 +74,9 @@ class ParseResult:
 
 def repair_message() -> str:
     return (
-        "Your previous reply had no ```bbagent fence, so nothing was executed. "
-        "Begin your reply with ```bbagent and include one to three action blocks.\n"
+        "Your previous reply had no executable action, so nothing was executed. "
+        "Begin with ```bbagent or a line `action: replace` (or search/read/done) "
+        "and include the SEARCH/REPLACE body.\n"
         "Example:\n" + EXAMPLE
     )
 
@@ -90,17 +101,78 @@ def head_tail(text: str, head: int = 40, tail: int = 40) -> str:
 
 
 def parse_reply(reply: str) -> ParseResult:
-    text = reply.replace("\r\n", "\n").replace("\r", "\n")
+    text = _strip_embedded_prompt(_normalize_reply(reply))
     matches = list(FENCE_RE.finditer(text))
-    if not matches:
-        return ParseResult(actions=[], error=repair_message())
-    ignored = max(0, len(matches) - 3)
-    actions: list[Action] = []
-    for index, match in enumerate(matches[:3]):
-        after_start = match.end()
-        after_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        actions.append(_parse_one(match.group(1), text[after_start:after_end]))
-    return ParseResult(actions=actions, ignored_extra=ignored)
+    fenced = ParseResult(actions=[], ignored_extra=0)
+    if matches:
+        ignored = max(0, len(matches) - 3)
+        actions: list[Action] = []
+        for index, match in enumerate(matches[:3]):
+            after_start = match.end()
+            after_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            actions.append(_parse_one(match.group(1), text[after_start:after_end]))
+        fenced = ParseResult(actions=actions, ignored_extra=ignored)
+    real = [item for item in fenced.actions if not _is_example_action(item)]
+    if real:
+        return ParseResult(actions=real, ignored_extra=fenced.ignored_extra)
+    unfenced = _parse_unfenced(text)
+    if unfenced.actions:
+        return unfenced
+    if fenced.actions:
+        return fenced
+    return ParseResult(actions=[], error=repair_message())
+
+
+def _strip_embedded_prompt(text: str) -> str:
+    """Copilot UI copy often includes the prompt. Keep only the assistant tail."""
+    index = text.rfind(PROMPT_TAIL)
+    if index < 0:
+        return text
+    rest = text[index + len(PROMPT_TAIL) :].lstrip()
+    return rest if rest else text
+
+
+def _is_example_action(action: Action) -> bool:
+    if action.path != "pkg/widget.py":
+        return False
+    body = action.body
+    return "return None" in body and "return value" in body
+
+
+def _normalize_reply(reply: str) -> str:
+    text = (reply or "").replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+    if "```" in text:
+        return text
+    lower = text.lower()
+    if "<pre" in lower or "&lt;" in text or "<div" in lower:
+        stripped = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "\n", text)
+        stripped = re.sub(r"(?is)<br\s*/?>", "\n", stripped)
+        stripped = re.sub(r"(?is)</(p|div|li|h[1-6]|tr)>", "\n", stripped)
+        stripped = re.sub(r"(?is)<[^>]+>", "", stripped)
+        text = html.unescape(stripped)
+    return text
+
+
+def _parse_unfenced(text: str) -> ParseResult:
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if ACTION_LINE_RE.match(line.strip())]
+    if starts:
+        actions: list[Action] = []
+        for index, start in enumerate(starts[:3]):
+            end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+            chunk = "\n".join(lines[start:end])
+            actions.append(_parse_one(chunk, ""))
+        return ParseResult(actions=actions, ignored_extra=max(0, len(starts) - 3))
+    if SEARCH_MARK in text and any(PATH_LINE_RE.match(line.strip()) for line in lines):
+        return ParseResult(actions=[_parse_one("action: replace\n" + text, "")])
+    return ParseResult(actions=[])
 
 
 def _parse_one(inner: str, after: str) -> Action:
@@ -197,14 +269,18 @@ def render_prompt(state: dict, tree: str) -> str:
     budget = int(state.get("config", {}).get("prompt_budget", 12000))
     excerpts = [dict(item) for item in state.get("excerpts") or []]
     digest = [dict(item) for item in state.get("digest") or []]
+    context_maps = dict(state.get("context_maps") or {})
     tree_text = tree
     shrunk_excerpt = False
     shrunk_digest = False
     shrunk_tree = False
     while True:
-        text = _compose(state, tree_text, excerpts, digest)
+        text = _compose(state, tree_text, excerpts, digest, context_maps)
         if len(text) <= budget:
             return text
+        if context_maps:
+            context_maps.pop(list(context_maps)[-1])
+            continue
         if len(excerpts) > 1:
             excerpts.pop()
             continue
@@ -226,11 +302,31 @@ def render_prompt(state: dict, tree: str) -> str:
         return text
 
 
-def _compose(state: dict, tree: str, excerpts: list[dict], digest: list[dict]) -> str:
-    parts = [HEADER.rstrip(), "", "TASK", state.get("task", "").rstrip(), "", "PLAN"]
+def _compose(
+    state: dict,
+    tree: str,
+    excerpts: list[dict],
+    digest: list[dict],
+    context_maps: dict[str, str] | None = None,
+) -> str:
+    header = HEADER.rstrip()
+    if state.get("context_sources"):
+        header += "\n" + CONTEXT_NOTE
+    parts = [header, "", "TASK", state.get("task", "").rstrip(), "", "PLAN"]
     plan = (state.get("plan") or "").strip()
     parts.append(plan if plan else "No plan yet. Your first block may be a plan.")
+    sources = state.get("context_sources") or []
+    if sources:
+        lines = []
+        for item in sources:
+            alias = item.get("alias") or "workspace"
+            path = item.get("path", "")
+            role = "writable" if item.get("writable") else "read-only"
+            lines.append(f"{alias}  {path}  {role}")
+        parts.extend(["", "CONTEXT SOURCES", "\n".join(lines)])
     parts.extend(["", "REPO MAP", tree.strip() or "(empty)"])
+    for alias, mapped in (context_maps or {}).items():
+        parts.extend(["", f"CONTEXT MAP {alias}", mapped.strip() or "(empty)"])
     shown = state.get("shown") or []
     if shown:
         visible = shown[-80:]

@@ -72,6 +72,23 @@ class Hit:
     score: float
 
 
+@dataclass(frozen=True)
+class Source:
+    alias: str
+    root: Path
+    writable: bool
+    prefix: str
+    inside: bool
+
+    def prefixed(self, rel: str) -> str:
+        text = (rel or "").replace("\\", "/").strip("/")
+        if not self.prefix:
+            return text or "."
+        if not text or text == ".":
+            return self.prefix
+        return f"{self.prefix}/{text}"
+
+
 def tokenize(text: str) -> list[str]:
     out: list[str] = []
     for match in TOKEN_RE.findall(text):
@@ -529,6 +546,7 @@ def fuse(
     chunks: list[Chunk],
     limit: int = 8,
     per_file: int = 3,
+    path_prefix: str | None = None,
 ) -> list[tuple[float, int]]:
     lexical = _ranks(bm25_scores)
     semantic = _ranks(embed_scores)
@@ -544,8 +562,11 @@ def fuse(
     fused.sort(key=lambda item: item[0], reverse=True)
     picked: list[tuple[float, int]] = []
     counts: dict[str, int] = {}
+    prefix = (path_prefix or "").replace("\\", "/").strip("/")
     for score, index in fused:
         path = chunks[index].path
+        if prefix and path != prefix and not path.startswith(prefix + "/"):
+            continue
         if counts.get(path, 0) >= per_file:
             continue
         picked.append((score, index))
@@ -611,9 +632,10 @@ def repo_map(root: Path, max_depth: int = 3, max_entries: int = 200) -> str:
 
 
 class Index:
-    def __init__(self, root: Path, dim: int = 128) -> None:
+    def __init__(self, root: Path, dim: int = 128, index_dir: Path | None = None) -> None:
         self.root = Path(root).resolve()
         self.dim = dim
+        self._index_dir_override = Path(index_dir).resolve() if index_dir is not None else None
         self.chunks: list[Chunk] = []
         self.capped = False
         self.file_count = 0
@@ -629,6 +651,8 @@ class Index:
 
     @property
     def index_dir(self) -> Path:
+        if self._index_dir_override is not None:
+            return self._index_dir_override
         return self.root / ".bbagent" / "index"
 
     def refresh(self) -> None:
@@ -801,13 +825,13 @@ class Index:
         scores = self._embed_scores(query_vec)
         return self._top(scores, k)
 
-    def search(self, query: str, k: int = 8) -> list[Hit]:
+    def search(self, query: str, k: int = 8, path_prefix: str | None = None) -> list[Hit]:
         prepared = self._prepare_query(query)
         if prepared is None:
             return []
         _, query_vec, lexical = prepared
         semantic = self._embed_scores(query_vec)
-        picked = fuse(lexical, semantic, self.chunks, limit=k)
+        picked = fuse(lexical, semantic, self.chunks, limit=k, path_prefix=path_prefix)
         return [self._hit(index, score) for score, index in picked]
 
     def _top(self, scores: list[float], k: int) -> list[Hit]:
@@ -835,3 +859,200 @@ def hit_dict(hit: Hit) -> dict:
         "text": hit.text,
         "score": hit.score,
     }
+
+
+class ContextError(ValueError):
+    pass
+
+
+_ALIAS_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _clean_alias(name: str) -> str:
+    cleaned = _ALIAS_UNSAFE.sub("-", name).strip(".-")
+    return cleaned or "ctx"
+
+
+def _make_alias(path: Path, used: set[str]) -> str:
+    taken = {item.lower() for item in used}
+    candidates = [_clean_alias(path.name), _clean_alias(f"{path.parent.name}-{path.name}")]
+    for base in candidates:
+        if base.lower() not in taken:
+            return base
+    base = candidates[0]
+    index = 2
+    while True:
+        item = f"{base}-{index}"
+        if item.lower() not in taken:
+            return item
+        index += 1
+
+
+def build_sources(workspace: Path, context_dirs: list[str]) -> list[Source]:
+    workspace = Path(workspace).resolve()
+    sources = [
+        Source(alias="", root=workspace, writable=True, prefix="", inside=True),
+    ]
+    used = {"workspace"}
+    seen = {workspace}
+    reserved = {(workspace / ".bbagent").resolve(), (workspace / ".git").resolve()}
+    for raw in context_dirs:
+        text = str(raw).strip()
+        if not text:
+            raise ContextError("context directory is empty")
+        path = Path(text)
+        if not path.is_absolute():
+            path = workspace / path
+        try:
+            path = path.resolve()
+        except OSError as exc:
+            raise ContextError(f"cannot resolve context directory {text}: {exc}") from exc
+        if not path.is_dir():
+            raise ContextError(f"context directory does not exist: {text}")
+        if path in seen:
+            continue
+        if path == workspace:
+            continue
+        if path in reserved:
+            raise ContextError(f"context directory is reserved: {text}")
+        if _is_under(workspace, path):
+            raise ContextError(f"context directory contains the workspace: {text}")
+        inside = _is_under(path, workspace)
+        alias = _make_alias(path, used)
+        used.add(alias)
+        seen.add(path)
+        if inside:
+            prefix = path.relative_to(workspace).as_posix()
+            sources.append(Source(alias=alias, root=path, writable=True, prefix=prefix, inside=True))
+        else:
+            sources.append(
+                Source(alias=alias, root=path, writable=False, prefix=f"@{alias}", inside=False)
+            )
+    return sources
+
+
+def split_alias(rel: str) -> tuple[str | None, str]:
+    raw = (rel or "").strip().replace("\\", "/")
+    if not raw.startswith("@"):
+        return None, raw
+    rest = raw[1:]
+    if "/" in rest:
+        alias, inner = rest.split("/", 1)
+    else:
+        alias, inner = rest, "."
+    return alias.strip() or None, (inner.strip() or ".")
+
+
+def find_source(sources: list[Source], alias: str) -> Source | None:
+    for source in sources:
+        if source.alias == alias:
+            return source
+    return None
+
+
+def _rrf_merge(lists: list[list[Hit]], k: int, per_file: int) -> list[Hit]:
+    scores: dict[tuple, float] = {}
+    chosen: dict[tuple, Hit] = {}
+    for ranked in lists:
+        for rank, hit in enumerate(ranked, start=1):
+            key = (hit.path, hit.start, hit.end)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            chosen[key] = hit
+    ordered = sorted(scores, key=lambda key: scores[key], reverse=True)
+    picked: list[Hit] = []
+    counts: dict[str, int] = {}
+    for key in ordered:
+        hit = chosen[key]
+        if counts.get(hit.path, 0) >= per_file:
+            continue
+        picked.append(Hit(hit.path, hit.start, hit.end, hit.qualname, hit.text, scores[key]))
+        counts[hit.path] = counts.get(hit.path, 0) + 1
+        if len(picked) >= k:
+            break
+    return picked
+
+
+class Corpus:
+    def __init__(self, workspace: Path, sources: list[Source], dim: int) -> None:
+        self.workspace = Path(workspace).resolve()
+        self.sources = sources
+        self.indexes: dict[str, Index] = {}
+        workspace_index = Index(self.workspace, dim=dim)
+        workspace_index.refresh()
+        self.indexes[""] = workspace_index
+        for source in sources:
+            if not source.alias or source.inside:
+                continue
+            extra = Index(
+                source.root,
+                dim=dim,
+                index_dir=self.workspace / ".bbagent" / "index" / "context" / source.alias,
+            )
+            extra.refresh()
+            self.indexes[source.alias] = extra
+
+    @property
+    def workspace_index(self) -> Index:
+        return self.indexes[""]
+
+    def refresh_stale(self) -> None:
+        for index in self.indexes.values():
+            if index.stale():
+                index.refresh()
+
+    def search(self, query: str, k: int = 8) -> list[Hit]:
+        workspace_index = self.workspace_index
+        lists: list[list[Hit]] = [workspace_index.search(query, k=k)]
+        for source in self.sources:
+            if not source.alias:
+                continue
+            if source.inside:
+                lists.append(workspace_index.search(query, k=k, path_prefix=source.prefix))
+                continue
+            extra = self.indexes[source.alias]
+            lists.append(
+                [
+                    Hit(
+                        source.prefixed(hit.path),
+                        hit.start,
+                        hit.end,
+                        hit.qualname,
+                        hit.text,
+                        hit.score,
+                    )
+                    for hit in extra.search(query, k=k)
+                ]
+            )
+        return _rrf_merge(lists, k=k, per_file=3)
+
+    def describe(self) -> list[dict]:
+        return [
+            {
+                "alias": source.alias or "workspace",
+                "path": str(source.root),
+                "writable": source.writable,
+            }
+            for source in self.sources
+        ]
+
+    def maps(self) -> dict[str, str]:
+        return {
+            source.alias: repo_map(source.root, max_depth=2, max_entries=40)
+            for source in self.sources
+            if source.alias
+        }
+
+    def capped(self) -> bool:
+        return any(index.capped for index in self.indexes.values())
+
+    def empty(self) -> bool:
+        return all(not index.chunks for index in self.indexes.values())
+
